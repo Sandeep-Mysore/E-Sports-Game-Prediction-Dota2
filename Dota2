@@ -1,0 +1,347 @@
+
+---
+title: "Final Project"
+author: "Wang, Yangyin (email: yaw79@pitt.edu)
+        Mysore, Sandeep (email: skm62@pitt.edu)"
+date: 12.2.2020
+output:
+  html_document:
+    code_folding: hide
+    theme: flatly
+    toc: yes
+    toc_float: yes
+---
+<style>
+    table {
+      border-collapse: collapse;
+    }
+      table, th, td, thead, tbody{
+        border: 1px solid black;
+    }
+    thead {
+        border-bottom: solid black;
+    }
+</style>
+
+# Overview
+
+```{r document_setup, echo=F, message=F, warning=F}
+# This chunk can include things you need for the rest of the document
+library(ggplot2)
+theme_set(theme_bw()) # change the default ggplot theme to black-and-white
+library(readr)
+library(ggcorrplot)
+
+library(readr) # CSV file I/O, e.g. the read_csv function
+library(dplyr)
+library(matrixStats)
+library(randomForest)
+library(ROCR)
+library(MASS) # for the example dataset 
+library(plyr) # for recoding data
+library(ROCR) # for plotting roc
+library(e1071) # for NB and SVM
+library(rpart) # for decision tree
+library(ada) # for adaboost
+library(class)
+
+knitr::opts_chunk$set(
+  echo=T, ## show your R code chunk
+  message = F, ## hide the message
+  warning = F, ## hide the warning
+  autodep = T ## make sure your separate code chunks can find the dependencies (from other code chunk)
+)
+```
+
+# Load data
+
+```{r}
+data = read.table("player_time.csv"
+                  ,header=TRUE
+                  , row.names=NULL
+                  ,sep = ","
+                  ,fill = TRUE)
+dataMatch = read.table("match.csv"
+                       ,header=TRUE
+                       , row.names=NULL
+                       ,sep = ","
+                       ,fill = TRUE)
+#Create dataframes
+df <- data.frame(data)
+dfMatch <- data.frame(dataMatch)
+
+#Remove all 0 rows at match start
+df <- df[!(df$times == 0),]
+
+#Remove different gamemodes
+dfMatch<- dfMatch[(dfMatch$game_mode == 22),]
+dfMatch <- dfMatch[,!(colnames(dfMatch) %in% c("negative_votes","positive_votes","cluster"))]
+
+```
+
+## Data Preparation
+
+
+```{r}
+#Sum of Radiant Gold
+RadiantGold <- df$gold_t_0 + df$gold_t_1 + df$gold_t_2 + df$gold_t_3 + df$gold_t_4
+df$RadiantGold <- RadiantGold
+
+#calculate standard deviation and median absolute deviation, to measure the gold distribution of 
+# each team members
+
+# Radiant 
+RadiantGoldSD <-apply(df[,c("gold_t_0","gold_t_1","gold_t_2","gold_t_3","gold_t_4")],1,sd)
+df$RadiantGoldSD <- RadiantGoldSD
+
+RadiantGoldMAD <-apply(df[,c("gold_t_0","gold_t_1","gold_t_2","gold_t_3","gold_t_4")],1,mad)
+df$RadiantGoldMAD <- RadiantGoldMAD
+
+# Sum of Dire Gold
+DireGold <- df$gold_t_128 + df$gold_t_129 + df$gold_t_130 + df$gold_t_131 + df$gold_t_132
+
+df$DireGold <- DireGold
+
+#Sum of Radiant XP
+RadiantXp <- df$xp_t_0 + df$xp_t_1 + df$xp_t_2 + df$xp_t_3 + df$xp_t_4
+df$RadiantXp <- RadiantXp
+
+#Calculate standard deviation and median absolute deviation, to measure the exp distribution of 
+# each team members
+
+RadiantXpSD <-apply(df[,c("xp_t_0","xp_t_1","xp_t_2","xp_t_3","xp_t_4")],1,sd)
+df$RadiantXpSD <- RadiantXpSD
+
+RadiantXpMAD <-apply(df[,c("xp_t_0","xp_t_1","xp_t_2","xp_t_3","xp_t_4")],1,mad)
+df$RadiantXpMAD <- RadiantXpMAD
+
+# Sum of Dire XP
+DireXp <- df$xp_t_128 + df$xp_t_129 + df$xp_t_130 + df$xp_t_131 + df$xp_t_132
+df$DireXp <- DireXp
+
+#Team Advantages
+df$RadiantGoldAdv <- df$RadiantGold - df$DireGold 
+df$DireGoldAdv <- df$DireGold - df$RadiantGold
+
+df$RadiantXpAdv <- df$RadiantXp - df$DireXp 
+df$DireXpAdv <- df$DireXp - df$RadiantXp
+
+#Merge match results with match id
+matchSoT <- merge(df,dfMatch, by ="match_id")
+matchSoT$radiant_win <- matchSoT$radiant_win == "True"
+matchSoT$dire_win <- !matchSoT$radiant_win
+
+#Get match status at 15mins
+match15 <- matchSoT[(matchSoT$times == 900),]
+
+#Get advantages of Radiant, and gold/exp deviation
+match15Adv <- match15[,c("match_id","RadiantXpAdv","RadiantGoldAdv","RadiantGoldSD","RadiantGoldMAD","RadiantXpSD","RadiantXpMAD","radiant_win")]
+
+
+# factorize 'radiant_win'
+
+dataset <- subset(match15Adv, select = -c(match_id))
+
+names(dataset)[names(dataset) == "radiant_win"] <- "y"
+dataset$y <- as.integer(as.logical(dataset$y))
+
+dataset$y <- as.factor(dataset$y)
+
+```
+# Model Setup
+
+```{r}
+
+set.seed(12345) # set the seed so you can get exactly the same results whenever you run the code
+
+do.classification <- function(train.set, test.set, 
+                              cl.name, verbose=F) {
+  ## note: to plot ROC later, we want the raw probabilities,
+  ## not binary decisions
+  switch(cl.name, 
+         knn = { # here we test k=3; you should evaluate different k's
+           prob = knn(train.set[,-1], test.set[,-1], cl=train.set[,1], k = 3, prob=T)
+           prob = attr(prob,"prob")
+           #print(cbind(prob,as.character(test.set$y)))
+           prob
+         },
+         lr = { # logistic regression
+           model = glm(y~., family=binomial, data=train.set)
+           if (verbose) {
+             print(summary(model))             
+           }
+           prob = predict(model, newdata=test.set, type="response") 
+           #print(cbind(prob,as.character(test.set$y)))
+           prob
+         },
+         nb = {
+           model = naiveBayes(y~., data=train.set)
+           prob = predict(model, newdata=test.set, type="raw") 
+           #print(cbind(prob,as.character(test.set$y)))
+           prob = prob[,2]/rowSums(prob) # renormalize the prob.
+           prob
+         },
+         dtree = {
+           model = rpart(y~., data=train.set)
+           if (verbose) {
+             print(summary(model)) # detailed summary of splits
+             printcp(model) # print the cross-validation results
+             plotcp(model) # visualize the cross-validation results
+             ## plot the tree
+             plot(model, uniform=TRUE, main="Classification Tree")
+             text(model, use.n=TRUE, all=TRUE, cex=.8)
+           }           
+           prob = predict(model, newdata=test.set)
+           
+           if (0) { # here we use the default tree, 
+             ## you should evaluate different size of tree
+             ## prune the tree 
+             pfit<- prune(model, cp=model$cptable[which.min(model$cptable[,"xerror"]),"CP"])
+             prob = predict(pfit, newdata=test.set)
+             ## plot the pruned tree 
+             plot(pfit, uniform=TRUE,main="Pruned Classification Tree")
+             text(pfit, use.n=TRUE, all=TRUE, cex=.8)             
+           }
+           #print(cbind(prob,as.character(test.set$y)))
+           prob = prob[,2]/rowSums(prob) # renormalize the prob.
+           prob
+         },
+         svm = {
+           model = svm(y~., data=train.set, probability=T)
+           if (0) { # fine-tune the model with different kernel and parameters
+             ## evaluate the range of gamma parameter between 0.000001 and 0.1
+             ## and cost parameter from 0.1 until 10
+             tuned <- tune.svm(y~., data = train.set, 
+                               kernel="radial", 
+                               gamma = 10^(-6:-1), cost = 10^(-1:1))
+             #print(summary(tuned))
+             gamma = tuned[['best.parameters']]$gamma
+             cost = tuned[['best.parameters']]$cost
+             model = svm(y~., data = train.set, probability=T, 
+                         kernel="radial", gamma=gamma, cost=cost)                        
+           }
+           prob = predict(model, newdata=test.set, probability=T)
+           prob = attr(prob,"probabilities")
+           #print(cbind(prob,as.character(test.set$y)))
+           #print(dim(prob))
+           prob = prob[,which(colnames(prob)==1)]/rowSums(prob)
+           prob
+         },
+         ada = {
+           model = ada(y~., data = train.set)
+           prob = predict(model, newdata=test.set, type='probs')
+           #print(cbind(prob,as.character(test.set$y)))
+           prob = prob[,2]/rowSums(prob)
+           prob
+         }
+  ) 
+}
+pre.test <- function(dataset, cl.name, r=0.6, prob.cutoff=0.5) {
+  ## Let's use 60% random sample as training and remaining as testing
+  ## by default use 0.5 as cut-off
+  n.obs <- nrow(dataset) # no. of observations in dataset
+  n.train = floor(n.obs*r)
+  train.idx = sample(1:n.obs,n.train)
+  train.idx
+  train.set = dataset[train.idx,]
+  test.set = dataset[-train.idx,]
+  cat('pre-test',cl.name,':',
+      '#training:',nrow(train.set),
+      '#testing',nrow(test.set),'\n')
+  prob = do.classification(train.set, test.set, cl.name)
+  # prob is an array of probabilities for cases being positive
+  
+  ## get confusion matrix
+  predicted = as.numeric(prob > prob.cutoff)
+  actual = test.set$y
+  confusion.matrix = table(actual,factor(predicted,levels=c(0,1)))
+  error = (confusion.matrix[1,2]+confusion.matrix[2,1]) / nrow(test.set)  
+  cat('error rate:',error,'\n')
+  # you may compute other measures based on confusion.matrix
+  # @see handout03 p.32-36
+  
+  ## plot ROC
+  result = data.frame(prob,actual)
+  pred = prediction(result$prob,result$actual)
+  perf = performance(pred, "tpr","fpr")
+  ##plot(perf)    
+}
+k.fold.cv <- function(dataset, cl.name, k.fold=10, prob.cutoff=0.5) {
+  ## default: 10-fold CV, cut-off 0.5 
+  n.obs <- nrow(dataset) # no. of observations 
+  s = sample(n.obs)
+  errors = dim(k.fold)
+  probs = NULL
+  actuals = NULL
+  for (k in 1:k.fold) {
+    test.idx = which(s %% k.fold == (k-1) ) # use modular operator
+    train.set = dataset[-test.idx,]
+    test.set = dataset[test.idx,]
+    cat(k.fold,'-fold CV run',k,cl.name,':',
+        '#training:',nrow(train.set),
+        '#testing',nrow(test.set),'\n')
+    prob = do.classification(train.set, test.set, cl.name)
+    predicted = as.numeric(prob > prob.cutoff)
+    actual = test.set$y
+    confusion.matrix = table(actual,factor(predicted,levels=c(0,1)))
+    confusion.matrix
+    error = (confusion.matrix[1,2]+confusion.matrix[2,1]) / nrow(test.set)  
+    errors[k] = error
+    cat('\t\terror=',error,'\n')
+    probs = c(probs,prob)
+    actuals = c(actuals,actual)
+    ## you may compute other measures and store them in arrays
+  }
+  avg.error = mean(errors)
+  cat(k.fold,'-fold CV results:','avg error=',avg.error,'\n')
+  
+  ## plot ROC
+  result = data.frame(probs,actuals)
+  pred = prediction(result$probs,result$actuals)
+  perf = performance(pred, "tpr","fpr")
+  plot(perf)
+  
+  ## get other measures by using 'performance'
+  get.measure <- function(pred, measure.name='auc') {
+    perf = performance(pred,measure.name)
+    m <- unlist(slot(perf, "y.values"))
+    #     print(slot(perf, "x.values"))
+    #     print(slot(perf, "y.values"))
+    m
+  }
+  err = mean(get.measure(pred, 'err'))
+  precision = mean(get.measure(pred, 'prec'),na.rm=T)
+  recall = mean(get.measure(pred, 'rec'),na.rm=T)
+  fscore = mean(get.measure(pred, 'f'),na.rm=T)
+  cat('error=',err,'precision=',precision,'recall=',recall,'f-score',fscore,'\n')
+  auc = get.measure(pred, 'auc')
+  cat('auc=',auc,'\n')
+}
+my.classifier <- function(dataset, cl.name='knn', do.cv=F) {
+  n.obs <- nrow(dataset) # no. of observations in dataset
+  n.cols <- ncol(dataset) # no. of predictors
+  cat('my dataset:',
+      n.obs,'observations',
+      n.cols-1,'predictors','\n')
+  cat('label (y) distribution:')
+  print(table(dataset$y))
+  
+  pre.test(dataset, cl.name)
+  if (do.cv) k.fold.cv(dataset, cl.name)
+}
+
+```
+# Get Results
+```{r}
+# use first 10000 rows as short dataset
+
+short_dataset15 <- dataset[1:10000, ]
+
+my.classifier(short_dataset15, cl.name='lr',do.cv=T)
+my.classifier(short_dataset15, cl.name='knn',do.cv=T)
+my.classifier(short_dataset15, cl.name='nb',do.cv=T)
+my.classifier(short_dataset15, cl.name='dtree',do.cv=T)
+my.classifier(short_dataset15, cl.name='svm',do.cv=T)
+
+```
+
